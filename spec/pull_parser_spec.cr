@@ -1,4 +1,5 @@
 require "./spec_helper"
+require "../src/toml/json"
 
 private enum CompassPoint
   NorthEast
@@ -64,6 +65,7 @@ end
 
 private struct FreeForm
   include TOML::Serializable
+  getter metadata : ::JSON::Any
   getter beats : Beats
 end
 
@@ -94,7 +96,7 @@ describe TOML::PullParser do
   end
 
   it "supports value constructors and writers on ordinary types" do
-    score = FreeForm.from_toml(%(beats = 3))
+    score = FreeForm.from_toml(%(metadata = {key = [7, true]}\nbeats = 3))
     score.beats.count.should eq(3)
     FreeForm.from_toml(score.to_toml).should eq(score)
     values = [score.beats, "rest"]
@@ -120,5 +122,37 @@ describe TOML::PullParser do
     reader = TOML::PullParser.new(TOML::Any.new(false))
     reader.read_bool.should be_false
     expect_raises(TOML::SerializableError, /already consumed/) { reader.skip }
+  end
+end
+
+describe TOML::JSON do
+  it "converts nested values without changing integer and float types" do
+    json = ::JSON.parse(%({"a":[false,3,3.0,{"b":"c"}]}))
+    node = TOML::JSON.from_json(json)
+    node["a"][1].raw.should be_a(Int64)
+    node["a"][2].raw.should be_a(Float64)
+    TOML::JSON.to_json(node).should eq(json)
+  end
+
+  it "distinguishes shared children from cyclic input" do
+    parts = [] of ::JSON::Any
+    shared = ::JSON::Any.new(parts)
+    TOML::JSON.from_json(::JSON::Any.new([shared, shared])).as_a.size.should eq(2)
+    parts << shared
+    expect_raises(TOML::SerializableError, /cyclic/) { TOML::JSON.from_json(shared) }
+    items = [] of TOML::Any
+    items << TOML::Any.new(items)
+    expect_raises(TOML::SerializableError, /cyclic/) { TOML::JSON.to_json(items.first) }
+  end
+
+  it "represents temporal values as strings and rejects non-finite JSON numbers" do
+    instant = TOML::Any.new(Time.utc(2024, 1, 2, nanosecond: 123))
+    TOML::JSON.to_json(instant).as_s.should eq("2024-01-02T00:00:00.000000123Z")
+    expect_raises(TOML::SerializableError, /non-finite/) { TOML::JSON.to_json(TOML::Any.new(Float64::NAN)) }
+  end
+
+  it "reports the exact location of an unrepresentable null" do
+    error = expect_raises(TOML::JSON::NullError) { TOML::JSON.from_json(::JSON.parse(%({"a.b":[null]}))) }
+    error.path.should eq(%($["a.b"][0]))
   end
 end

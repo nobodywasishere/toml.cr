@@ -161,3 +161,12 @@ When a type also implements JSON serialization, declare its TOML field
 aliases and unit conversions with `TOML::Field`. Put shared derived-state
 initialization in `after_initialize` for generated constructors, or call
 the model's constructor from a whole-table converter.
+
+### JSON value trees
+
+With `require "toml/json"`, use `TOML::JSON.from_json(json_any)` and
+`TOML::JSON.to_json(toml_any)` to convert trees directly. JSON null raises
+`TOML::JSON::NullError` with a path such as `$["items"][2]`. TOML temporal
+values become JSON strings, and non-finite floats raise
+`TOML::SerializableError`. JSON strings remain strings on the return trip.
+The integration also supports `JSON::Any` fields in serializable models.
