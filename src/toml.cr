@@ -17,6 +17,19 @@ module TOML
   def self.parse_file(filename : String | Path) : TOML::Table
     parse File.read(filename)
   end
+
+  # Serializes a table as a TOML 1.1 document. Nested tables use inline syntax.
+  #
+  # Values may be TOML::Any or Crystal booleans, integers, floats, strings, date
+  # and time values, arrays, and hashes with String keys.
+  def self.dump(table : Hash(String, V)) : String forall V
+    String.build { |io| dump(table, io) }
+  end
+
+  # Writes a TOML 1.1 document to the given IO.
+  def self.dump(table : Hash(String, V), io : IO) : Nil forall V
+    Writer.new(io).write(table)
+  end
 end
 
 require "./toml/temporal"

@@ -40,7 +40,11 @@ struct TOML::Any
   # :ditto:
   def self.new(raw : Float) : self
     # FIXME: Workaround for https://github.com/crystal-lang/crystal/issues/11645
-    new(raw.to_f64)
+    converted = raw.to_f64
+    if converted.infinite? && raw.finite?
+      raise ArgumentError.new("TOML float is outside the range of Float64")
+    end
+    new(converted)
   end
 
   # Assumes the underlying value is an `Array` or `Hash` and returns its size.

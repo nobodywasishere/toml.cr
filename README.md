@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/crystal-community/toml.cr/actions/workflows/ci.yml/badge.svg)](https://github.com/crystal-community/toml.cr/actions/workflows/ci.yml)
 
-A [TOML](https://github.com/toml-lang/toml) parser for [Crystal](http://crystal-lang.org/), supporting [TOML 1.1](https://toml.io/en/v1.1.0).
+A [TOML](https://github.com/toml-lang/toml) parser and writer for [Crystal](http://crystal-lang.org/), supporting [TOML 1.1](https://toml.io/en/v1.1.0).
 
 ## Installation
 
@@ -44,3 +44,17 @@ to access them.
 
 Offset date-times use the UTC range of Crystal's time type (years 1 through
 9999). Leap seconds are unsupported.
+
+### Writing TOML
+
+```crystal
+TOML.dump({"title" => "TOML Example"}) # => "title = \"TOML Example\"\n"
+TOML.dump(toml, STDOUT)
+```
+
+`TOML.dump` accepts a parsed table or a Crystal hash with string keys.
+Supported values include booleans, signed 64-bit integers, floats, strings,
+the four date and time types, arrays, and nested hashes with string keys.
+Nested tables use inline syntax, and offset date-times are written in UTC.
+Dumping a parsed document preserves the values and discards comments and
+original formatting.
