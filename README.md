@@ -45,6 +45,11 @@ to access them.
 Offset date-times use the UTC range of Crystal's time type (years 1 through
 9999). Leap seconds are unsupported.
 
+Version 0.9 requires Crystal 1.14.1 or later. If you are upgrading from 0.8,
+replace `raw.as(Time)` for local values with the corresponding local type.
+Use its calendar and clock components if your application needs to supply a
+time zone explicitly.
+
 ### Writing TOML
 
 ```crystal
