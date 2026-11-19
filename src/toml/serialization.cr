@@ -1,3 +1,5 @@
+require "uri"
+
 module TOML
   # Configures how an instance variable maps to TOML. See Serializable.
   annotation Field
@@ -23,8 +25,8 @@ module TOML
   # `TOML::SerializableError` if multiple members accept the value.
   # Include `TOML::Serializable::Strict` to reject unknown keys. Output-only
   # keys are recognized in strict mode and skipped during deserialization.
-  # Model initialization hooks run after union selection. Converters may be
-  # called while testing candidates and should avoid side effects.
+  # Generated model initialization hooks run after union selection. Custom reader
+  # constructors and converters can run while probing union candidates.
   #
   # `@[TOML::Field]` supports these options:
   #
@@ -34,7 +36,9 @@ module TOML
   # - `ignore_deserialize` skips the field on input when true. Both options
   #   accept boolean literals and constants defined with boolean literals.
   # - `ignore_serialize` skips the field on output if the expression is truthy.
-  # - `converter` overrides conversion. It defines `from_toml(TOML::Any)`
+  # - `converter` overrides conversion. A cursor-based converter defines
+  #   `from_toml(TOML::PullParser)` and `to_toml(value, TOML::Builder)`.
+  #   A value-based converter defines `from_toml(TOML::Any)`
   #   and `to_toml(value)`, which returns a value representable in TOML. To
   #   report invalid input, a converter can raise `TOML::SerializableError`.
   module Serializable
@@ -42,6 +46,10 @@ module TOML
       # Reads a TOML document from a string or IO.
       def self.from_toml(input : ::String | ::IO) : self
         from_toml(::TOML.parse(input))
+      end
+
+      def self.new(pull : ::TOML::PullParser) : self
+        pull.read(self)
       end
 
       # Reads an already parsed TOML table.
@@ -65,14 +73,31 @@ module TOML
 
       # :nodoc:
       def self.__toml_prepare(table : ::TOML::Table, decoder : ::TOML::Serializable::Decoder) : ::Proc(self)
-        unknown = decoder.unknown_keys(table, self, typeof(__toml_keys(self)))
-        fields = __toml_read_fields(self, table, decoder)
-        ->{
-          instance = allocate
-          instance.initialize(__toml_fields: fields, __toml_unknown: unknown)
-          ::GC.add_finalizer(instance) if instance.responds_to?(:finalize)
-          instance
-        }
+        {% verbatim do %}
+          {% begin %}
+            {% options = @type.instance.annotation(::TOML::Serializable::Options) %}
+            {% if options && (converter = options[:converter]) %}
+              model = decoder.convert_table(table, self, {{ converter }})
+              -> : self { model }
+            {% elsif ([@type.instance] + @type.instance.ancestors).any? { |owner| owner.methods.any? { |method| method.name == "initialize" && method.args.size == 1 && method.args[0].restriction && (arg = method.args[0].restriction.resolve?) && ::TOML::PullParser <= arg } } %}
+              model = allocate
+              reader = ::TOML::PullParser.new(table)
+              model.initialize(reader)
+              reader.finish
+              ::GC.add_finalizer(model) if model.responds_to?(:finalize)
+              -> : self { model }
+            {% else %}
+              unknown = decoder.unknown_keys(table, self, typeof(__toml_keys(self)))
+              fields = __toml_read_fields(self, table, decoder)
+              ->{
+                instance = allocate
+                instance.initialize(__toml_fields: fields, __toml_unknown: unknown)
+                ::GC.add_finalizer(instance) if instance.responds_to?(:finalize)
+                instance
+              }
+            {% end %}
+          {% end %}
+        {% end %}
       end
 
       # :nodoc:
@@ -110,9 +135,22 @@ module TOML
 
       # :nodoc:
       def to_toml_table(encoder : ::TOML::Serializable::Encoder) : ::TOML::Table
-        table = ::TOML::Table.new
-        __toml_write_layers(::Union(typeof(self)), encoder, table)
-        table
+        {% verbatim do %}
+          {% begin %}
+            {% options = @type.annotation(::TOML::Serializable::Options) %}
+            {% if @type <= ::TOML::Serializable::ReadOnly %}
+              raise ::TOML::SerializableError.new("#{self.class} is read-only")
+            {% elsif options && (converter = options[:converter]) %}
+              {{ converter }}.to_toml(self)
+            {% elsif ([@type] + @type.ancestors).any? { |owner| owner.methods.any? { |method| method.name == "to_toml" && method.args.size == 1 && method.args[0].restriction && (arg = method.args[0].restriction.resolve?) && ::TOML::Builder <= arg } } %}
+              ::TOML::Builder.capture(encoder) { |builder| to_toml(builder) }.as_h
+            {% else %}
+              table = ::TOML::Table.new
+              __toml_write_layers(::Union(typeof(self)), encoder, table)
+              table
+            {% end %}
+          {% end %}
+        {% end %}
       end
 
       def self.__toml_keys(scope : S.class) forall S
@@ -321,7 +359,7 @@ module TOML
             {% key = field[:key] %}
             {{ name.id }}: decoder.field(table, model.name, {{ key }}, required: {{ field[:required] }}) do |value|
               {% if converter = field[:converter] %}
-                converted = {{ converter }}.from_toml(value)
+                converted = decoder.convert_field(value, {{ converter }}, ::Union(typeof(model.allocate.@{{ name.id }})))
                 ->{ converted }
               {% elsif declaration = field[:declaration] %}
                 decoder.prepare(value, ::Union(typeof(model.allocate.@{{ name.id }})), ::TOML::Serializable.__toml_shape(::Tuple({{ declaration }})))
@@ -354,7 +392,7 @@ module TOML
               raise ::TOML::SerializableError.new("Duplicate TOML output key #{ {{ key }}.inspect } for #{self.class} field #{ {{ name.id.stringify }}.inspect }")
             end
             {% if converter = field[:converter] %}
-              table[{{ key }}] = encoder.write({{ converter }}.to_toml(%value))
+              table[{{ key }}] = encoder.convert_field(%value, {{ converter }})
             {% elsif field[:readable] && (declaration = field[:declaration]) %}
               table[{{ key }}] = encoder.write_typed(%value, ::Union(typeof(@{{ name.id }})), ::TOML::Serializable.__toml_shape(::Tuple({{ declaration }})))
             {% elsif field[:readable] %}
@@ -387,6 +425,46 @@ module TOML
     end
 
     protected def on_unknown_toml_attribute(key : String)
+    end
+
+    # A whole-table converter implements from_toml(TOML::Table) and
+    # to_toml(model) : TOML::Table. It owns construction of the model.
+    annotation Options
+    end
+
+    # Omits the generated field encoder and rejects attempts to write the model.
+    module ReadOnly
+    end
+
+    # Accepts either TOML numeric type for a floating-point field.
+    module FloatConverter(T)
+      def self.from_toml(value : TOML::Any) : T
+        {% raise "FloatConverter requires a floating-point type" unless T < Float %}
+        case number = value.raw
+        when Int64
+          T.new(number)
+        when Float64
+          Decoder.convert_float(number, T)
+        else
+          raise SerializableError.new("Expected a TOML integer or float, got #{number.class}")
+        end
+      end
+
+      def self.to_toml(value : T) : T
+        value
+      end
+    end
+
+    # Accepts Crystal enum names and unambiguous snake_case aliases.
+    module EnumConverter(T)
+      def self.from_toml(value : TOML::Any) : T
+        {% raise "EnumConverter requires an enum type" unless T < Enum %}
+        Decoder.read_enum(value, T, aliases: true)
+      end
+
+      def self.to_toml(value : T) : String
+        value.__toml_member_names
+      end
     end
 
     # Rejects TOML keys that do not map to a declared, non-ignored field.
@@ -439,10 +517,10 @@ module TOML
       {% end %}
     end
 
+    private alias Scalar = Bool | String | URI | TOML::Temporal | TOML::Any
+
     # :nodoc:
     class Decoder
-      private alias Scalar = Bool | String | TOML::Temporal | TOML::Any
-
       protected getter ambiguity : AmbiguousUnionError? = nil
 
       # Prepare candidate values without running serializable initialization hooks.
@@ -452,6 +530,29 @@ module TOML
           raise error
         end
         plan.call
+      end
+
+      def initialize(@allow_coercion : Bool = true) : Nil
+      end
+
+      def convert_field(value : TOML::Any, converter : C, type : T.class) : T forall C, T
+        {% begin %}
+          {% methods = C.ancestors.reduce(C.methods) { |all, owner| all + owner.methods } %}
+          {% writer = methods.any? { |method| method.name == "to_toml" && method.args.size == 2 } %}
+          {% reader = methods.any? { |method| method.name == "from_toml" && method.args.size == 1 && ((method.args[0].restriction && (arg = method.args[0].restriction.resolve?) && ::TOML::PullParser <= arg && !(::TOML::Any <= arg)) || (!method.args[0].restriction && writer)) } %}
+          {% if reader %}
+            pull = TOML::PullParser.new(value)
+            converter.from_toml(pull).tap { pull.finish }
+          {% else %}
+            converter.from_toml(value)
+          {% end %}
+        {% end %}
+      end
+
+      def convert_table(table : TOML::Table, owner : T.class, converter : C.class) : T forall T, C
+        converter.from_toml(table)
+      rescue error : ArgumentError | TypeCastError | OverflowError | KeyError | IndexError
+        raise SerializableError.new("#{owner}: #{error.message}", error)
       end
 
       def unknown_keys(table : TOML::Table, owner : T.class, keys : K.class) : Array(String) forall T, K
@@ -522,14 +623,31 @@ module TOML
         {% end %}
       end
 
-      def prepare(value : TOML::Any, type : Hash(String, T).class, shape : CollectionShape? = nil) : Proc(Hash(String, T)) forall T
+      def prepare(value : TOML::Any, type : Hash(K, T).class, shape : CollectionShape? = nil) : Proc(Hash(K, T)) forall K, T
         source = expect(value, TOML::Table)
+        keyed = decode_keys(source, K)
         {% if !T.union? && (T <= Scalar || T < Int || T < Float || T < Enum) %}
-          decoded = source.transform_values { |element| read_scalar(element, T) }
+          decoded = keyed.transform_values { |element| read_scalar(element, T) }
           -> { decoded }
         {% else %}
-          items = source.transform_values { |element| prepare(element, T, shape.try(&.element)) }
-          -> : Hash(String, T) { items.transform_values(&.call) }
+          items = keyed.transform_values { |element| prepare(element, T, shape.try(&.element)) }
+          -> : Hash(K, T) { items.transform_values(&.call) }
+        {% end %}
+      end
+
+      private def decode_keys(source : TOML::Table, type : K.class) : Hash(K, TOML::Any) forall K
+        {% if K == String %}
+          source
+        {% elsif K < Enum %}
+          mapped = Hash(K, TOML::Any).new(initial_capacity: source.size)
+          source.each do |name, element|
+            key = self.class.read_enum(TOML::Any.new(name), K, aliases: @allow_coercion)
+            raise SerializableError.new("Duplicate #{K} key #{name.inspect}") if mapped.has_key?(key)
+            mapped[key] = element
+          end
+          mapped
+        {% else %}
+          {% raise "Unsupported TOML table key type #{K}; use String, an enum, or a TOML field converter" %}
         {% end %}
       end
 
@@ -547,13 +665,32 @@ module TOML
           {% raise "Cannot determine concrete TOML members for #{T}; use a TOML field converter" %}
         {% elsif T <= TOML::Serializable %}
           T.__toml_prepare(expect(value, TOML::Table), self)
-        {% else %}
+        {% elsif T <= Scalar || T < Int || T < Float || T < Enum %}
           decoded = read_scalar(value, T)
           -> : T { decoded }
+        {% elsif T.methods.any? { |method| method.name == "initialize" && method.args.size == 1 && method.args[0].restriction && (arg = method.args[0].restriction.resolve?) && ::TOML::PullParser <= arg } || T.class.methods.any? { |method| method.name == "new" && method.args.size == 1 && method.args[0].restriction && (arg = method.args[0].restriction.resolve?) && ::TOML::PullParser <= arg } %}
+          reader = TOML::PullParser.new(value)
+          decoded = T.new(reader)
+          reader.finish
+          -> : T { decoded }
+        {% else %}
+          {% raise "Unsupported TOML field type #{T}; use a TOML field converter or include TOML::Serializable" %}
         {% end %}
       end
 
       def prepare(value : TOML::Any, type : T.class, members : Tuple(*M)) : Proc(T) forall T, M
+        if plan = select_member(value, type, members, false)
+          return plan
+        end
+        if @allow_coercion
+          if plan = select_member(value, type, members, true)
+            return plan
+          end
+        end
+        raise SerializableError.new("Expected #{T}, got #{value.raw.class}")
+      end
+
+      private def select_member(value : TOML::Any, type : T.class, members : Tuple(*M), allow_coercion : Bool) : Proc(T)? forall T, M
         selected = nil
         selected_type = nil
 
@@ -564,7 +701,7 @@ module TOML
             {% unless member == Nil || seen.includes?(member) %}
               {% seen << member %}
               member_type, shape = members[{{ index }}]
-              candidate = Decoder.new
+              candidate = Decoder.new(allow_coercion)
               if plan = candidate.try_prepare(value, member_type, shape)
                 if error = candidate.ambiguity
                   @ambiguity ||= error
@@ -580,7 +717,7 @@ module TOML
             {% end %}
           {% end %}
         {% end %}
-        selected || raise SerializableError.new("Expected #{T}, got #{value.raw.class}")
+        selected
       end
 
       protected def try_prepare(value : TOML::Any, type : T.class, shape : (Tuple | CollectionShape)?) : Proc(T)? forall T
@@ -596,43 +733,62 @@ module TOML
       private def read_scalar(value : TOML::Any, type : T.class) : T forall T
         {% if T == TOML::Any %}
           value
+        {% elsif T == URI %}
+          URI.parse(expect(value, String))
         {% elsif T < Int %}
           begin
             T.new(expect(value, Int64))
           rescue error : OverflowError
             raise TOML::SerializableError.new("Integer is outside the range of #{T}", error)
           end
-        {% elsif T == Float32 || T == Float64 %}
-          raw = expect(value, Float64)
-          converted = T.new!(raw)
-          if raw.finite? && converted.infinite?
-            raise TOML::SerializableError.new("Float is outside the range of #{T}")
-          end
-          converted
         {% elsif T < Float %}
-          raw = expect(value, Float64)
-          raise SerializableError.new("Float is outside the range of #{T}") unless raw.finite?
-          T.new(raw)
+          if @allow_coercion && (number = value.as_i64?)
+            return T.new(number)
+          end
+          self.class.convert_float(expect(value, Float64), T)
         {% elsif T < Enum %}
-          self.class.read_enum(value, T)
+          self.class.read_enum(value, T, aliases: @allow_coercion)
         {% else %}
           expect(value, T)
         {% end %}
       end
 
-      def self.read_enum(value : TOML::Any, type : T.class) : T forall T
-        name = value.as_s? || raise SerializableError.new("Expected String, got #{value.raw.class}")
-        {% if T.annotation(::Flags) %}
-          name.split(" | ").reduce(T.new(0)) { |flags, part| flags | enum_member(part, T) }
+      def self.convert_float(raw : Float64, type : T.class) : T forall T
+        {% if T == Float32 || T == Float64 %}
+          converted = T.new!(raw)
+          if raw.finite? && converted.infinite?
+            raise SerializableError.new("Float is outside the range of #{T}")
+          end
+          converted
         {% else %}
-          enum_member(name, T)
+          raise SerializableError.new("Float is outside the range of #{T}") unless raw.finite?
+          T.new(raw)
         {% end %}
       end
 
-      private def self.enum_member(name : String, type : T.class) : T forall T
+      def self.read_enum(value : TOML::Any, type : T.class, *, aliases : Bool = false) : T forall T
+        name = value.as_s? || raise SerializableError.new("Expected String, got #{value.raw.class}")
+        {% if T.annotation(::Flags) %}
+          name.split(" | ").reduce(T.new(0)) { |flags, part| flags | enum_member(part, T, aliases) }
+        {% else %}
+          enum_member(name, T, aliases)
+        {% end %}
+      end
+
+      private def self.enum_member(name : String, type : T.class, aliases : Bool) : T forall T
         {% for member in T.constants %}
           return T.new({{ T.constant(member) }}) if name == {{ member.stringify }}
         {% end %}
+        if aliases
+          match = nil
+          {% for member in T.constants %}
+            if name == {{ member.stringify.underscore.downcase }}
+              raise SerializableError.new("Ambiguous #{T} alias #{name.inspect}") if match
+              match = T.new({{ T.constant(member) }})
+            end
+          {% end %}
+          return match if match
+        end
         raise TOML::SerializableError.new("Unknown #{T} member #{name.inspect}")
       end
 
@@ -647,11 +803,23 @@ module TOML
     class Encoder
       @ancestors = Set(UInt64).new
 
+      def convert_field(value : V, converter : C) : TOML::Any forall V, C
+        {% if C.ancestors.reduce(C.methods) { |methods, owner| methods + owner.methods }.any? { |method| method.name == "to_toml" && method.args.size == 2 } %}
+          TOML::Builder.capture(self) { |builder| converter.to_toml(value, builder) }
+        {% else %}
+          write(converter.to_toml(value))
+        {% end %}
+      end
+
       def write(value : TOML::Any) : TOML::Any
         value
       end
 
-      def write(value : Bool | Int | String | TOML::Temporal) : TOML::Any
+      def write(value : Bool | String | TOML::Temporal) : TOML::Any
+        TOML::Any.new(value)
+      end
+
+      def write(value : Int) : TOML::Any
         TOML::Any.new(value)
       rescue error : OverflowError
         raise TOML::SerializableError.new("TOML integer is outside the signed 64-bit range", error)
@@ -663,16 +831,20 @@ module TOML
         raise TOML::SerializableError.new(error.message, error)
       end
 
+      def write(value : URI) : TOML::Any
+        TOML::Any.new(value.to_s)
+      end
+
       def write(value : Enum) : TOML::Any
         write(value.__toml_member_names)
       end
 
       def write(value : Array) : TOML::Any
-        write_array(value) { |element| write(element) }
+        write_array(value) { |element| encode(element) }
       end
 
-      def write(value : Hash(String, T)) : TOML::Any forall T
-        write_table(value) { |element| write(element) }
+      def write(value : Hash(K, T)) : TOML::Any forall K, T
+        write_table(value) { |element| encode(element) }
       end
 
       def write_typed(value : Array(T), type : U.class, shape : CollectionShape? = nil) : TOML::Any forall T, U
@@ -682,8 +854,8 @@ module TOML
         write_array(value) { |element| write_typed(element, T, shape.try(&.element)) }
       end
 
-      def write_typed(value : Hash(String, T), type : U.class, shape : CollectionShape? = nil) : TOML::Any forall T, U
-        unless value.class == Hash(String, T)
+      def write_typed(value : Hash(K, T), type : U.class, shape : CollectionShape? = nil) : TOML::Any forall K, T, U
+        unless value.class == Hash(K, T)
           raise SerializableError.new("Cannot round-trip #{value.class} as #{type}; use a TOML field converter")
         end
         write_table(value) { |element| write_typed(element, T, shape.try(&.element)) }
@@ -716,19 +888,47 @@ module TOML
       end
 
       def write_typed(value : Object, type : T.class) : TOML::Any forall T
-        write(value)
+        encode(value)
+      end
+
+      def encode(value : T) : TOML::Any forall T
+        {% if T.union? %}
+          # The tuple expression inside typeof is never evaluated. It preserves
+          # file-private member types and avoids materializing virtual metaclasses.
+          case value
+          {% for index in 0...T.union_types.size %}
+          when typeof(Pointer(T::T).null.value[{{ index }}])
+            encode(value.as(typeof(Pointer(T::T).null.value[{{ index }}])))
+          {% end %}
+          else
+            raise SerializableError.new("No TOML encoder for #{value.class}")
+          end
+        {% elsif T <= Scalar || T < Int || T < Float || T <= Enum || T <= Serializable || T <= Array || T <= Hash || T == Nil %}
+          write(value)
+        {% elsif T.methods.any? { |method| method.name == "to_toml" && method.args.size == 1 && method.args[0].restriction && (arg = method.args[0].restriction.resolve?) && ::TOML::Builder <= arg } %}
+          with_container(value) { TOML::Builder.capture(self) { |builder| value.to_toml(builder) } }
+        {% else %}
+          {% raise "Unsupported TOML value type #{T}; use a TOML field converter or include TOML::Serializable" %}
+        {% end %}
       end
 
       private def write_array(value : Array, &) : TOML::Any
         with_container(value) { TOML::Any.new(value.map { |element| yield element }) }
       end
 
-      private def write_table(value : Hash(String, T), &) : TOML::Any forall T
+      private def write_table(value : Hash(K, T), &) : TOML::Any forall K, T
         with_container(value) do
           table = TOML::Table.new(initial_capacity: value.size)
           value.each do |key, element|
-            raise ArgumentError.new("Duplicate TOML key #{key.inspect}") if table.has_key?(key)
-            table[key] = yield element
+            name = {% if K < Enum %}
+                     key.__toml_member_names
+                   {% elsif K == String %}
+                     key
+                   {% else %}
+              {% raise "Unsupported TOML table key type #{K}; use String, an enum, or a TOML field converter" %}
+            {% end %}
+            raise ArgumentError.new("Duplicate TOML key #{name.inspect}") if table.has_key?(name)
+            table[name] = yield element
           end
           TOML::Any.new(table)
         end

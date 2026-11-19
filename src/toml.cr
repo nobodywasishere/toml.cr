@@ -47,4 +47,12 @@ module TOML
 end
 
 require "./toml/temporal"
-require "./toml/*"
+require "./toml/any"
+require "./toml/builder"
+require "./toml/lexer"
+require "./toml/parse_exception"
+require "./toml/parser"
+require "./toml/pull_parser"
+require "./toml/serialization"
+require "./toml/token"
+require "./toml/writer"

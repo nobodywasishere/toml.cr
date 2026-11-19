@@ -82,12 +82,18 @@ server.to_toml
 ```
 
 The module supports TOML scalars and temporal types, enums (by member name),
-arrays, string-keyed hashes, unions, and nested serializable types.
+URI values (as strings), arrays, hashes with string or enum keys, unions,
+and nested serializable types.
 `from_toml` accepts a string, an IO, or a parsed TOML table. `to_toml`
 returns a string or writes to an IO, and `to_toml_table` returns a table.
-Enum names are case-sensitive. Flag combinations use names joined by ` | `.
+Enum fields and enum table keys accept declared names and unambiguous
+snake_case aliases. Writers emit the declared names. Flag combinations use
+names joined by ` | `. Floating-point fields also accept integer literals.
+These rules apply inside arrays and hashes. Union decoding first tries to
+match without integer widening or enum aliases, so `Int64 | Float64`
+preserves the type of a numeric literal. Two keys mapping to the same member raise a decoding error.
 Reading a union raises `TOML::SerializableError` if more than one member
-accepts the value. Use a field converter to define an unambiguous format
+accepts the value at the same priority. Use a field converter to define an unambiguous format
 for overlapping types. A field that holds a subclass of its declared type
 also needs a converter if the subclass is to round-trip. Writing raises
 `TOML::SerializableError` when the default decoder would lose the subclass
@@ -108,5 +114,50 @@ to reject them. Strict mode recognizes declared output-only keys and skips
 their input values. Use `TOML::Field` for aliases, ignored fields, and custom
 converters. Union selection can try converters for several candidates.
 Keep converters free of side effects and raise `TOML::SerializableError`
-to report invalid input. Model initialization hooks run only after a
-candidate has been selected.
+to report invalid input. Generated initialization hooks run after union selection. Custom reader
+constructors and converters can run while trying candidates.
+
+### Custom wire formats
+
+A type can implement `initialize(reader : TOML::PullParser)` and
+`to_toml(builder : TOML::Builder)`. Generated models use these methods for
+nested values too. The reader traverses a parsed TOML tree. Inside
+`read_object` or `read_array`, consume each child exactly once with
+`read(Type)`, a scalar reader such as `read_string`, or `skip`.
+
+Field converters use the same reader and writer. For example, this converter
+stores a percentage as a fraction in Crystal.
+
+```crystal
+module Percentage
+  def self.from_toml(reader : TOML::PullParser) : Float64
+    reader.read_float / 100
+  end
+
+  def self.to_toml(value : Float64, builder : TOML::Builder) : Nil
+    builder.scalar(value * 100)
+  end
+end
+
+struct Opacity
+  include TOML::Serializable
+
+  @[TOML::Field(converter: Percentage)]
+  getter alpha : Float64
+end
+
+Opacity.from_toml("alpha = 50").alpha # => 0.5
+```
+
+For a model whose table keys come from the input, annotate the model with
+`@[TOML::Serializable::Options(converter: MyMapping)]`. The converter
+implements `self.from_toml(table : TOML::Table)` returning the model and
+`self.to_toml(model)` returning a `TOML::Table`. It controls construction,
+unknown-key handling and output for that model, including inside collections.
+For a one-way mapping, include `TOML::Serializable::ReadOnly` and implement
+only the input method. Writing the model raises `TOML::SerializableError`.
+
+When a type also implements JSON serialization, declare its TOML field
+aliases and unit conversions with `TOML::Field`. Put shared derived-state
+initialization in `after_initialize` for generated constructors, or call
+the model's constructor from a whole-table converter.
