@@ -551,6 +551,14 @@ describe TOML::Serializable do
     end
   end
 
+  it "lets the untyped builder write subclass fields" do
+    section = PortsSection.new("local", [8080_u16])
+    output = TOML.build do |builder|
+      builder.field "sections", [section] of NamedSection
+    end
+    TOML.parse(output)["sections"][0]["ports"][0].as_i.should eq(8080)
+  end
+
   it "lets output-only fields write subclass data" do
     config = OutputOnlySection.new(PortsSection.new("local", [8080_u16]))
     TOML.parse(config.to_toml)["section"]["ports"][0].as_i.should eq(8080)
@@ -575,6 +583,9 @@ describe TOML::Serializable do
   it "writes declared enum names when the enum overrides its display text" do
     field = TypedField(Status).from_toml(%(value = "Ready"))
     field.to_toml.should eq(%(value = "Ready"\n))
+
+    values = [Status::Ready, Feature::Read | Feature::Write]
+    TOML.build(&.field("values", values)).should eq(%(values = ["Ready", "Read | Write"]\n))
   end
 
   it "round-trips flag combinations and rejects unnamed enum values on output" do

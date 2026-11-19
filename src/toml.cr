@@ -18,6 +18,20 @@ module TOML
     parse File.read(filename)
   end
 
+  # Builds a TOML 1.1 document and returns it as a string.
+  def self.build(& : Builder ->) : String
+    builder = Builder.new
+    yield builder
+    builder.to_toml
+  end
+
+  # Builds a TOML 1.1 document and writes it to the given IO.
+  def self.build(io : IO, & : Builder ->) : Nil
+    builder = Builder.new
+    yield builder
+    builder.to_toml(io)
+  end
+
   # Serializes a table as a TOML 1.1 document. Nested tables use inline syntax.
   #
   # Values may be TOML::Any or Crystal booleans, integers, floats, strings, date
