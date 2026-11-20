@@ -1,0 +1,13 @@
+Version: 1.7.0
+
+Typing/MacroCallArgumentTypeRestriction:
+  Enabled: true
+
+Typing/ProcLiteralReturnTypeRestriction:
+  Enabled: true
+
+Typing/MethodParameterTypeRestriction:
+  Enabled: true
+
+Typing/MethodReturnTypeRestriction:
+  Enabled: true

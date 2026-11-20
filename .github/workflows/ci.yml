@@ -10,7 +10,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu, macos]
-        crystal: [latest, nightly]
+        crystal: ["1.14.1", latest, nightly]
     runs-on: ${{ matrix.os }}-latest
 
     steps:
@@ -30,3 +30,37 @@ jobs:
 
       - name: Check formatting
         run: crystal tool format --check
+
+  lint:
+    name: Ameba
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Run Ameba Linter
+        uses: crystal-ameba/github-action@master
+
+  conformance:
+    name: TOML 1.1 conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: crystal-lang/install-crystal@v1
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.x'
+          cache: false
+
+      - name: Install toml-test
+        run: GOBIN="$RUNNER_TEMP" go install github.com/toml-lang/toml-test/v2/cmd/toml-test@96fd088448ec0f4d9f061c730ed7854399c46faf
+
+      - name: Run encoder and decoder conformance suites
+        env:
+          TZ: UTC
+        run: |
+          crystal build scripts/conformance/decoder.cr -o "$RUNNER_TEMP/toml-decoder"
+          crystal build scripts/conformance/encoder.cr -o "$RUNNER_TEMP/toml-encoder"
+          cd "$RUNNER_TEMP"
+          ./toml-test test -toml=1.1 -decoder=./toml-decoder -encoder=./toml-encoder
